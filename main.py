@@ -27,13 +27,24 @@ def send_telegram_message(msg):
 
 # Fetch gold prices
 def fetch_hourly_gold_data():
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey=fed6f938e3ec484e929c9a3e5053fe3a"
     resp = requests.get(url)
-    if resp.status_code == 200:
-        df = pd.DataFrame(resp.json()['values'])[::-1]
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df['price'] = df['close'].astype(float)
-        return df[['datetime', 'price']].reset_index(drop=True)
+
+    try:
+        data = resp.json()
+        print("🔍 API response preview:", data)  # DEBUG LINE
+
+        if 'values' in data:
+            df = pd.DataFrame(data['values'])[::-1]
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df['price'] = df['close'].astype(float)
+            return df[['datetime', 'price']].reset_index(drop=True)
+        else:
+            send_telegram_message(f"⚠️ API error: {data.get('message', 'No values returned.')}")
+            return None
+    except Exception as e:
+        send_telegram_message(f"❌ Exception while fetching data: {e}")
+        return None
 
 # Prepare data for LSTM
 def prepare_data(data, window_size=12):
@@ -107,11 +118,10 @@ async def trade_on_signal(current_price, predicted_price):
 async def main_loop():
     while True:
         df = fetch_hourly_gold_data()
-        if df is not None:
-            curr = df.iloc[-1]['price']
-            pred = predict_price(df)
-            print(f"Curr: {curr:.2f} | Pred: {pred:.2f}")
-            await trade_on_signal(curr, pred)
+if df is None:
+    print("⚠️ Skipping this round due to bad data")
+    await asyncio.sleep(600)  # Wait 10 minutes before retrying
+    continue
         else:
             print("Fetch error")
         time.sleep(14400)
