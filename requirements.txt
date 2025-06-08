@@ -1,0 +1,5 @@
+tensorflow
+pandas
+requests
+websockets
+scikit-learn
