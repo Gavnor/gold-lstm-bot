@@ -118,13 +118,17 @@ async def trade_on_signal(current_price, predicted_price):
 async def main_loop():
     while True:
         df = fetch_hourly_gold_data()
-if df is None:
-    print("⚠️ Skipping this round due to bad data")
-    await asyncio.sleep(600)  # Wait 10 minutes before retrying
-    continue
-        else:
-            print("Fetch error")
-        time.sleep(14400)
+        if df is None:
+            print("⚠️ Skipping this round due to bad data")
+            await asyncio.sleep(600)  # Wait 10 minutes before retrying
+            continue
+        
+        # If data is good, process prediction and trading
+        predicted_price = predict_price(df)
+        current_price = df['price'].iloc[-1]
+        await trade_on_signal(current_price, predicted_price)
+        
+        await asyncio.sleep(14400)  # Wait 4 hours before next fetch
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
