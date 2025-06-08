@@ -14,7 +14,7 @@ import json
 
 TELEGRAM_TOKEN = os.getenv("7815331489:AAEe0BYA1lKdsFP88-4ta1d9Szg95bQYXw0")
 TELEGRAM_CHAT_ID = os.getenv("1035839883")
-DERIV_TOKEN = os.getenv("DOyvRgW9c8kERfE")
+DERIV_TOKEN = os.getenv("5qnxMv59XNplpY3")
 TWELVE_API_KEY = os.getenv("fed6f938e3ec484e929c9a3e5053fe3a")
 
 MODEL_PATH = 'model/gold_lstm_model.h5'
