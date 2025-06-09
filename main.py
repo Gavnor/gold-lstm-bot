@@ -105,7 +105,7 @@ async def place_trade(contract_type, amount):
 
 async def trade_on_signal(current_price, predicted_price):
     gap = abs(predicted_price - current_price)
-    if gap < 10:
+    if gap < 20:
         print("Gap too small, skipping")
         return
     balance = await get_balance()
