@@ -105,15 +105,16 @@ async def place_trade(contract_type, amount):
 
 async def trade_on_signal(current_price, predicted_price):
     gap = abs(predicted_price - current_price)
-    if gap < 20:
-        print("Gap too small, skipping")
-        return
+    print(f"⚠️ Forcing trade for debugging. Gap = {gap:.2f}")
     balance = await get_balance()
+    if balance <= 0:
+        print("Balance fetch failed. Skipping trade.")
+        return
     stake = round(0.2 * balance, 2)
     contract = "CALL" if predicted_price > current_price else "PUT"
     await place_trade(contract, stake)
-    log_trade("AUTO", current_price, predicted_price, stake, contract)
-    send_telegram_message(f"TRADE: {contract} | Curr: {current_price:.2f} | Pred: {predicted_price:.2f} | Stake: ${stake}")
+    log_trade("DEBUG", current_price, predicted_price, stake, contract)
+    send_telegram_message(f"✅ [DEBUG TRADE] {contract} | Curr: {current_price:.2f} | Pred: {predicted_price:.2f} | Stake: ${stake}")
 
 async def main_loop():
     while True:
@@ -125,7 +126,7 @@ async def main_loop():
         predicted_price = predict_price(df)
         current_price = df['price'].iloc[-1]
         await trade_on_signal(current_price, predicted_price)
-        await asyncio.sleep(14400)
+        await asyncio.sleep(600)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
