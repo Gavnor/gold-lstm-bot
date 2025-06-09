@@ -1,4 +1,16 @@
-import os import requests import numpy as np import pandas as pd import time import csv from datetime import datetime from tensorflow.keras.models import Sequential, load_model from tensorflow.keras.layers import LSTM, Dense from sklearn.preprocessing import MinMaxScaler import asyncio import websockets import json
+import os
+import requests 
+import numpy as np 
+import pandas as pd 
+import time 
+import csv 
+from datetime import datetime 
+from tensorflow.keras.models import Sequential, load_model 
+from tensorflow.keras.layers import LSTM, Dense 
+from sklearn.preprocessing import MinMaxScaler 
+import asyncio 
+import websockets 
+import json
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") DERIV_TOKEN = os.getenv("DERIV_TOKEN") TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
@@ -60,3 +72,4 @@ predicted_price = predict_price(df)
     await asyncio.sleep(14400)
 
 if name == 'main': asyncio.run(main_loop())
+
