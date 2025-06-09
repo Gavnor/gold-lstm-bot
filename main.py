@@ -25,10 +25,10 @@ LOG_FILE = 'data/trade_log.csv'
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 WEBSOCKET_TIMEOUT = 10
-MAX_STAKE_PERCENT = 0.2  # Risk management: max 20% of balance per trade
+MAX_STAKE_PERCENT = 0.2  # Max 20% of balance per trade
 MIN_BALANCE = 10  # Minimum account balance to trade
 MAX_STAKE = 10000  # Maximum stake per trade
-PRICE_THRESHOLD = 10  # Minimum price difference to trade
+PRICE_THRESHOLD = 10  # Min price difference to trade
 TRADE_DURATION = 2  # Trade duration in hours
 
 # Force IPv4 to prevent DNS resolution issues
@@ -55,11 +55,11 @@ def is_market_open():
     return True
 
 async def get_deriv_connection():
-    """Establish robust WebSocket connection to Deriv with fallback endpoints"""
+    """Establish robust WebSocket connection to Deriv"""
     endpoints = [
-        'wss://ws.binaryws.com/websockets/v3?app_id=1089',  # Primary
-        'wss://ws.deriv.com/websockets/v3?app_id=1089',     # Fallback 1
-        'wss://ws.deriv.be/websockets/v3?app_id=1089'       # Fallback 2 (EU)
+        'wss://ws.binaryws.com/websockets/v3?app_id=1089',
+        'wss://ws.deriv.com/websockets/v3?app_id=1089',
+        'wss://ws.deriv.be/websockets/v3?app_id=1089'
     ]
     
     for url in endpoints:
@@ -71,13 +71,11 @@ async def get_deriv_connection():
                 close_timeout=10,
                 ssl=True
             )
-            # Test connection
             await asyncio.wait_for(conn.ping(), timeout=5)
             return conn
         except Exception as e:
             print(f"Failed to connect to {url}: {str(e)}")
             continue
-    
     raise ConnectionError("All Deriv endpoints failed")
 
 async def with_retry_async(func, operation_name="operation"):
@@ -158,9 +156,9 @@ def log_trade_entry(entry_type, current, predicted, stake, contract):
         writer.writerow([
             datetime.utcnow().isoformat(),
             entry_type,
-            current,
-            predicted,
-            stake,
+            round(current, 2),
+            round(predicted, 2),
+            round(stake, 2),
             contract,
             "PENDING"
         ])
@@ -173,23 +171,21 @@ def log_trade_outcome(contract_id, profit):
         writer = csv.writer(outfile)
         for row in reader:
             if row[-1] == "PENDING":
-                row[-1] = f"CLOSED: {profit:.2f}"
+                row[-1] = f"CLOSED: {round(float(profit), 2)}"
             writer.writerow(row)
     os.replace(temp_file, LOG_FILE)
-    send_telegram_message(f"📊 Trade closed\nProfit: ${profit:.2f}")
+    send_telegram_message(f"📊 Trade closed\nProfit: ${round(float(profit), 2)}")
 
 async def get_balance():
     """Get current account balance"""
     async def _get_balance():
         async with await get_deriv_connection() as ws:
-            # Authorize
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             auth_response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
             
             if 'error' in json.loads(auth_response):
                 raise ValueError(f"Auth error: {auth_response}")
             
-            # Get balance
             await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
             response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
             return float(json.loads(response)['balance']['balance'])
@@ -197,24 +193,26 @@ async def get_balance():
     return await with_retry_async(_get_balance, "balance check")
 
 async def place_trade(contract_type, amount):
-    """Execute trade on Deriv"""
+    """Execute trade on Deriv with proper decimal handling"""
     async def _place_trade():
         async with await get_deriv_connection() as ws:
             # Authorize
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
             
-            # Trade parameters for 2-hour duration
+            # Round amount to 2 decimal places
+            rounded_amount = round(float(amount), 2)
+            
             trade_params = {
                 "buy": 1,
-                "price": amount,
+                "price": rounded_amount,
                 "parameters": {
-                    "amount": amount,
+                    "amount": rounded_amount,
                     "basis": "stake",
                     "contract_type": contract_type,
                     "currency": "USD",
                     "duration": TRADE_DURATION,
-                    "duration_unit": "h",  # Hours
+                    "duration_unit": "h",
                     "symbol": "frxXAUUSD"
                 }
             }
@@ -243,8 +241,7 @@ async def check_trade_result(contract_id):
                 "subscribe": 1
             }))
             
-            # Wait for settlement (2 hours + buffer)
-            await asyncio.sleep(TRADE_DURATION * 3600 + 300)
+            await asyncio.sleep(TRADE_DURATION * 3600 + 300)  # 2h + buffer
             
             response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
             data = json.loads(response)
@@ -254,7 +251,7 @@ async def check_trade_result(contract_id):
         return None
 
 async def trade_on_signal(current_price, predicted_price):
-    """Execute trading logic with price threshold check"""
+    """Execute trading logic with all checks"""
     try:
         if not is_market_open():
             send_telegram_message("⏸️ Market closed - skipping trade")
@@ -263,35 +260,33 @@ async def trade_on_signal(current_price, predicted_price):
         price_diff = abs(predicted_price - current_price)
         if price_diff < PRICE_THRESHOLD:
             send_telegram_message(
-                f"⏭️ Price difference too small ({price_diff:.2f} < {PRICE_THRESHOLD})\n"
-                f"Current: {current_price:.2f}\n"
-                f"Predicted: {predicted_price:.2f}"
+                f"⏭️ Price difference too small ({round(price_diff, 2)} < {PRICE_THRESHOLD})\n"
+                f"Current: {round(current_price, 2)}\n"
+                f"Predicted: {round(predicted_price, 2)}"
             )
             return
 
         balance = await get_balance()
         if balance < MIN_BALANCE:
-            send_telegram_message(f"⚠️ Low balance: ${balance:.2f} (Min: ${MIN_BALANCE})")
+            send_telegram_message(f"⚠️ Low balance: ${round(balance, 2)} (Min: ${MIN_BALANCE})")
             return
         
-        stake = min(MAX_STAKE_PERCENT * balance, MAX_STAKE)
+        stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
         contract_type = "CALL" if predicted_price > current_price else "PUT"
 
-        # Execute trade
         trade_result = await place_trade(contract_type, stake)
         if trade_result:
             log_trade_entry("AUTO", current_price, predicted_price, stake, contract_type)
             send_telegram_message(
                 f"✅ Trade executed:\n"
                 f"Type: {contract_type}\n"
-                f"Current: {current_price:.2f}\n"
-                f"Predicted: {predicted_price:.2f}\n"
-                f"Stake: ${stake:.2f}\n"
+                f"Current: {round(current_price, 2)}\n"
+                f"Predicted: {round(predicted_price, 2)}\n"
+                f"Stake: ${stake}\n"
                 f"Duration: {TRADE_DURATION}h\n"
-                f"Balance: ${balance:.2f}"
+                f"Balance: ${round(balance, 2)}"
             )
             
-            # Monitor trade outcome
             profit = await check_trade_result(trade_result['contract_id'])
             if profit is not None:
                 log_trade_outcome(trade_result['contract_id'], profit)
@@ -308,14 +303,14 @@ async def main_loop():
                 current_price = df['price'].iloc[-1]
                 predicted_price = predict_price(df)
                 
-                print(f"📊 Current: {current_price:.2f} | Predicted: {predicted_price:.2f}")
+                print(f"📊 Current: {round(current_price, 2)} | Predicted: {round(predicted_price, 2)}")
                 await trade_on_signal(current_price, predicted_price)
             
             await asyncio.sleep(600)  # Check every 10 minutes
             
         except Exception as e:
             send_telegram_message(f"🚨 Critical error in main loop: {str(e)}")
-            await asyncio.sleep(300)  # Wait 5 minutes before retry
+            await asyncio.sleep(300)
 
 if __name__ == '__main__':
     print("🚀 Starting Gold Trading Bot")
