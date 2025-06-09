@@ -20,19 +20,17 @@ TWELVE_API_KEY = os.getenv("fed6f938e3ec484e929c9a3e5053fe3a")
 MODEL_PATH = 'model/gold_lstm_model.h5'
 LOG_FILE = 'data/trade_log.csv'
 
-# Telegram alert
 def send_telegram_message(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg})
 
-# Fetch gold prices
 def fetch_hourly_gold_data():
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey=fed6f938e3ec484e929c9a3e5053fe3a"
+    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
     resp = requests.get(url)
 
     try:
         data = resp.json()
-        print("🔍 API response preview:", data)  # DEBUG LINE
+        print("🔍 API response preview:", data)
 
         if 'values' in data:
             df = pd.DataFrame(data['values'])[::-1]
@@ -46,7 +44,6 @@ def fetch_hourly_gold_data():
         send_telegram_message(f"❌ Exception while fetching data: {e}")
         return None
 
-# Prepare data for LSTM
 def prepare_data(data, window_size=12):
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(data[['price']])
@@ -56,35 +53,39 @@ def prepare_data(data, window_size=12):
         y.append(scaled[i])
     return np.array(X), np.array(y), scaler
 
-# Train or load model, then predict
 def predict_price(data):
     X, y, scaler = prepare_data(data)
     X = X.reshape((X.shape[0], X.shape[1], 1))
-    if not os.path.exists(MODEL_PATH):
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+    try:
+        model = load_model(MODEL_PATH)
+    except Exception as e:
+        print(f"⚠️ Model load failed: {e}")
+        print("🔁 Re-training model on CPU...")
         model = Sequential()
         model.add(LSTM(50, return_sequences=False, input_shape=(X.shape[1], 1)))
         model.add(Dense(1))
         model.compile(optimizer='adam', loss='mse')
         model.fit(X, y, epochs=10, batch_size=8, verbose=0)
         model.save(MODEL_PATH)
-    else:
-        model = load_model(MODEL_PATH)
+
     pred_scaled = model.predict(X[-1].reshape(1, X.shape[1], 1))[0][0]
     return scaler.inverse_transform([[pred_scaled]])[0][0]
 
-# Log trades to CSV
 def log_trade(entry, current, predicted, stake, contract):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, 'a', newline='') as f:
-        csv.writer(f).writerow([datetime.utcnow(), entry, current, predicted, stake, contract])
+        writer = csv.writer(f)
+        writer.writerow([datetime.utcnow(), entry, current, predicted, stake, contract])
 
-# Deriv trading via WebSocket
 async def get_balance():
     async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
-        return float(json.loads(await ws.recv())['balance']['balance'])
+        response = await ws.recv()
+        return float(json.loads(response)['balance']['balance'])
 
 async def place_trade(contract_type, amount):
     async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
@@ -101,6 +102,7 @@ async def place_trade(contract_type, amount):
                 "duration_unit": "t",
                 "symbol": "frxXAUUSD"
             }}))
+        await ws.recv()
         print("Trade placed.")
 
 async def trade_on_signal(current_price, predicted_price):
@@ -120,15 +122,15 @@ async def main_loop():
         df = fetch_hourly_gold_data()
         if df is None:
             print("⚠️ Skipping this round due to bad data")
-            await asyncio.sleep(600)  # Wait 10 minutes before retrying
+            await asyncio.sleep(600)
             continue
-        
-        # If data is good, process prediction and trading
+
         predicted_price = predict_price(df)
         current_price = df['price'].iloc[-1]
         await trade_on_signal(current_price, predicted_price)
-        
-        await asyncio.sleep(14400)  # Wait 4 hours before next fetch
+
+        await asyncio.sleep(14400)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
+    
