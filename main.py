@@ -76,7 +76,7 @@ def log_trade(entry, current, predicted, stake, contract):
         writer.writerow([datetime.utcnow(), entry, current, predicted, stake, contract])
 
 async def get_balance():
-    async with websockets.connect("wss://ws.binaryws.com/websockets/v3?app_id=1089") as ws:
+    async with websockets.connect("URL = "wss://ws.deriv.be/websockets/v3?app_id=1089") as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
@@ -84,7 +84,7 @@ async def get_balance():
         return float(json.loads(response)['balance']['balance'])
 
 async def place_trade(contract_type, amount):
-    async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+    async with websockets.connect("URL = "wss://ws.deriv.be/websockets/v3?app_id=1089"") as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({
