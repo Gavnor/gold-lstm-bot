@@ -37,8 +37,8 @@ def send_telegram_message(msg):
     except Exception as e:
         print(f"Failed to send Telegram message: {e}")
 
-async def with_retry(func, operation_name="operation"):
-    """Retry decorator for network operations"""
+async def with_retry_async(func, operation_name="operation"):
+    """Retry decorator for async operations"""
     for attempt in range(MAX_RETRIES):
         try:
             return await func()
@@ -49,10 +49,22 @@ async def with_retry(func, operation_name="operation"):
             await asyncio.sleep(RETRY_DELAY)
             send_telegram_message(f"⚠️ Retrying {operation_name} (attempt {attempt + 1}): {str(e)}")
 
+def with_retry_sync(func, operation_name="operation"):
+    """Retry decorator for synchronous operations"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                send_telegram_message(f"❌ Failed {operation_name} after {MAX_RETRIES} attempts: {str(e)}")
+                raise
+            time.sleep(RETRY_DELAY)
+            send_telegram_message(f"⚠️ Retrying {operation_name} (attempt {attempt + 1}): {str(e)}")
+
 def fetch_hourly_gold_data():
     """Fetch gold price data from Twelve Data API"""
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
     try:
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
         resp = requests.get(url, timeout=10)
         data = resp.json()
         if 'values' in data:
@@ -134,7 +146,7 @@ async def get_balance():
             response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
             return float(json.loads(response)['balance']['balance'])
     
-    return await with_retry(_get_balance, "balance check")
+    return await with_retry_async(_get_balance, "balance check")
 
 async def place_trade(contract_type, amount):
     """Execute trade on Deriv"""
@@ -168,7 +180,7 @@ async def place_trade(contract_type, amount):
             
             return True
     
-    return await with_retry(_place_trade, "trade execution")
+    return await with_retry_async(_place_trade, "trade execution")
 
 async def trade_on_signal(current_price, predicted_price):
     """Execute trading logic"""
@@ -198,7 +210,8 @@ async def main_loop():
     """Main trading loop"""
     while True:
         try:
-            df = await with_retry(lambda: fetch_hourly_gold_data(), "data fetch")
+            # Use synchronous retry for data fetch
+            df = with_retry_sync(fetch_hourly_gold_data, "data fetch")
             if df is not None:
                 current_price = df['price'].iloc[-1]
                 predicted_price = predict_price(df)
