@@ -1,6 +1,8 @@
-tensorflow
+numpy
 pandas
 requests
-websockets
+tensorflow
 scikit-learn
+websockets
 ta
+scipy
