@@ -2,248 +2,193 @@ import os
 import requests
 import numpy as np
 import pandas as pd
-import time
-import csv
-from datetime import datetime, timedelta, timezone
+import pandas_ta as ta
+from datetime import datetime, timedelta
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
 import asyncio
 import websockets
 import json
 import socket
+from scipy.stats import pearsonr
+import joblib
 
-# Environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
-# Configuration
-MODEL_PATH = 'model/gold_lstm_model.h5'
+MODEL_PATH = 'model/enhanced_gold_lstm.h5'
+SCALER_PATH = 'model/scaler.save'
 LOG_FILE = 'data/trade_log.csv'
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 WEBSOCKET_TIMEOUT = 10
-MAX_STAKE_PERCENT = 0.2
 
-# Force IPv4 to prevent DNS resolution issues
+TRADE_DURATION = 4
+STOP_LOSS_PCT = 0.03
+TAKE_PROFIT_PCT = 0.06
+MAX_STAKE_PERCENT = 0.2
+MIN_BALANCE = 10
+MAX_STAKE = 10000
+VOLATILITY_THRESHOLD = 1.5
+CORRELATION_THRESHOLD = 0.7
+
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
-def send_telegram_message(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=10)
-    except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+def fetch_multi_timeframe_data():
+    timeframes = [
+        ('1h', 48),
+        ('4h', 24),
+        ('1d', 30)
+    ]
+    all_data = []
+    for tf, size in timeframes:
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={tf}&outputsize={size}&apikey={TWELVE_API_KEY}"
+        try:
+            data = requests.get(url, timeout=10).json()
+            if 'values' in data:
+                df = pd.DataFrame(data['values'])[::-1]
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df['price'] = df['close'].astype(float)
+                df['high'] = df['high'].astype(float)
+                df['low'] = df['low'].astype(float)
+                df['timeframe'] = tf
+                all_data.append(df)
+        except Exception as e:
+            send_telegram_message(f"⚠️ Failed {tf} data: {str(e)}")
+    return pd.concat(all_data) if all_data else None
 
-def is_market_open():
-    utc_now = datetime.now(timezone.utc)
-    est_time = utc_now - timedelta(hours=5)
-    weekday = est_time.weekday()
-    hour = est_time.hour
-    if (weekday == 4 and hour >= 17) or weekday == 5 or (weekday == 6 and hour < 18):
+def fetch_correlation_data():
+    symbols = {
+        'DXY': 'US Dollar Index',
+        'TNX': '10-Year Treasury Yield'
+    }
+    corr_data = {}
+    for symbol in symbols:
+        try:
+            url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
+            data = requests.get(url, timeout=10).json()
+            if 'values' in data:
+                df = pd.DataFrame(data['values'])[::-1]
+                df['close'] = df['close'].astype(float)
+                corr_data[symbol] = df['close'].values
+        except Exception as e:
+            send_telegram_message(f"⚠️ Failed {symbol} data: {str(e)}")
+    return corr_data
+
+def add_features(df):
+    df['rsi'] = ta.rsi(df['price'], length=14)
+    macd = ta.macd(df['price'])
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
+    df['atr'] = ta.atr(df['high'], df['low'], df['price'], length=14)
+    df['adx'] = ta.adx(df['high'], df['low'], df['price'], length=14)['ADX_14']
+    df['ema20'] = ta.ema(df['price'], length=20)
+    corr_data = fetch_correlation_data()
+    for symbol, values in corr_data.items():
+        if len(values) == len(df):
+            rolling_corr = pd.Series(df['price']).rolling(window=20).apply(lambda x: pearsonr(x, values[-len(x):])[0])
+            df[f'corr_{symbol.lower()}'] = rolling_corr
+    for tf in ['4h', '1d']:
+        tf_df = df[df['timeframe'] == tf]
+        if not tf_df.empty:
+            df[f'{tf}_rsi'] = tf_df['rsi'].iloc[-1]
+            df[f'{tf}_atr'] = tf_df['atr'].iloc[-1]
+    return df.dropna()
+
+def build_advanced_model(input_shape):
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.4),
+        LSTM(64, return_sequences=True),
+        Dropout(0.3),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+def prepare_enhanced_data(df):
+    df = add_features(df)
+    scaler = MinMaxScaler()
+    features = ['price', 'rsi', 'macd', 'atr', 'adx', 'corr_dxy', 'corr_tnx', '4h_rsi', '1d_rsi']
+    scaled = scaler.fit_transform(df[features])
+    X, y = [], []
+    window_size = 24
+    for i in range(window_size, len(scaled)):
+        X.append(scaled[i-window_size:i])
+        y.append(scaled[i, 0])
+    joblib.dump(scaler, SCALER_PATH)
+    return np.array(X), np.array(y), scaler
+
+def is_strong_signal(df, current_price, predicted_price):
+    last = df.iloc[-1]
+    if abs(last['corr_dxy']) > CORRELATION_THRESHOLD and last['corr_dxy'] * (predicted_price - current_price) > 0:
+        return False
+    if (last['4h_rsi'] > 70 and predicted_price > current_price) or \
+       (last['4h_rsi'] < 30 and predicted_price < current_price):
+        return False
+    if last['atr'] > (df['atr'].mean() * VOLATILITY_THRESHOLD):
         return False
     return True
 
-async def get_deriv_connection():
-    endpoints = [
-        'wss://ws.binaryws.com/websockets/v3?app_id=1089',
-        'wss://ws.deriv.com/websockets/v3?app_id=1089',
-        'wss://ws.deriv.be/websockets/v3?app_id=1089'
-    ]
-    for url in endpoints:
-        try:
-            conn = await websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=60,
-                close_timeout=10,
-                ssl=True
-            )
-            await asyncio.wait_for(conn.ping(), timeout=5)
-            return conn
-        except Exception as e:
-            print(f"Failed to connect to {url}: {str(e)}")
-    raise ConnectionError("All Deriv endpoints failed")
-
-async def with_retry_async(func, operation_name="operation"):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return await func()
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                send_telegram_message(f"❌ Failed {operation_name} after {MAX_RETRIES} attempts: {str(e)}")
-                raise
-            await asyncio.sleep(RETRY_DELAY)
-            send_telegram_message(f"⚠️ Retrying {operation_name} (attempt {attempt + 1}): {str(e)}")
-
-def with_retry_sync(func, operation_name="operation"):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return func()
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                send_telegram_message(f"❌ Failed {operation_name} after {MAX_RETRIES} attempts: {str(e)}")
-                raise
-            time.sleep(RETRY_DELAY)
-            send_telegram_message(f"⚠️ Retrying {operation_name} (attempt {attempt + 1}): {str(e)}")
-
-def fetch_hourly_gold_data():
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=48&apikey={TWELVE_API_KEY}"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if 'values' in data:
-            df = pd.DataFrame(data['values'])[::-1]
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df['price'] = df['close'].astype(float)
-            return df[['datetime', 'price']].reset_index(drop=True)
-        send_telegram_message(f"⚠️ API error: {data.get('message', 'No values returned')}")
-    except Exception as e:
-        send_telegram_message(f"❌ Data fetch failed: {str(e)}")
-    return None
-
-def prepare_data(data, window_size=12):
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(data[['price']])
-    X, y = [], []
-    for i in range(window_size, len(scaled)):
-        X.append(scaled[i-window_size:i])
-        y.append(scaled[i])
-    return np.array(X), np.array(y), scaler
-
-def predict_price(data):
-    X, y, scaler = prepare_data(data)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    try:
-        model = load_model(MODEL_PATH)
-    except Exception:
-        model = Sequential([
-            LSTM(50, return_sequences=False, input_shape=(X.shape[1], 1)),
-            Dense(1)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=10, batch_size=8, verbose=0)
-        model.save(MODEL_PATH)
-    pred_scaled = model.predict(X[-1].reshape(1, X.shape[1], 1))[0][0]
-    return scaler.inverse_transform([[pred_scaled]])[0][0]
-
-def log_trade(entry, current, predicted, stake, contract):
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    with open(LOG_FILE, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            entry,
-            current,
-            predicted,
-            stake,
-            contract,
-            "SUCCESS" if stake > 0 else "FAILED"
-        ])
-
-async def get_balance():
-    async def _get_balance():
-        async with await get_deriv_connection() as ws:
-            await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-            auth_response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
-            if 'error' in json.loads(auth_response):
-                raise ValueError(f"Auth error: {auth_response}")
-            await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
-            response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
-            return float(json.loads(response)['balance']['balance'])
-    return await with_retry_async(_get_balance, "balance check")
-
-async def place_trade(contract_type, amount):
-    async def _place_trade():
-        async with await get_deriv_connection() as ws:
-            await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-            await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
-            duration_options = [
-                {"duration": 5, "duration_unit": "m"},
-                {"duration": 1, "duration_unit": "h"},
-                {"duration": 1, "duration_unit": "d"}
-            ]
-            for duration in duration_options:
-                trade_params = {
-                    "buy": 1,
-                    "price": amount,
-                    "parameters": {
-                        "amount": amount,
-                        "basis": "stake",
-                        "contract_type": contract_type,
-                        "currency": "USD",
-                        "symbol": "frxXAUUSD",
-                        **duration
-                    }
-                }
-                await ws.send(json.dumps(trade_params))
-                response = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKET_TIMEOUT)
-                response_data = json.loads(response)
-                if 'error' not in response_data:
-                    return True
-                if "duration" in response_data.get('error', {}).get('message', '').lower():
-                    continue
-                raise ValueError(f"Trade error: {response}")
-            raise ValueError("All duration options failed")
-    return await with_retry_async(_place_trade, "trade execution")
-
-async def trade_on_signal(current_price, predicted_price):
-    if not is_market_open():
-        send_telegram_message("⏸️ Market closed - skipping trade")
-        return
-    if abs(predicted_price - current_price) < 10:
-        print("🔸 Gap too small, skipping trade")
-        return
-    try:
-        balance = await get_balance()
-        if balance <= 10:
-            send_telegram_message(f"⚠️ Low balance: ${balance:.2f}")
-            return
-        stake = min(round(MAX_STAKE_PERCENT * balance, 2), 10000)
-        contract = "CALL" if predicted_price > current_price else "PUT"
-        if await place_trade(contract, stake):
-            log_trade("AUTO", current_price, predicted_price, stake, contract)
-            send_telegram_message(
-                f"✅ Trade executed:\n"
-                f"Type: {contract}\n"
-                f"Current: {current_price:.2f}\n"
-                f"Predicted: {predicted_price:.2f}\n"
-                f"Stake: ${stake:.2f}\n"
-                f"Balance: ${balance:.2f}"
-            )
-    except Exception as e:
-        log_trade("AUTO", current_price, predicted_price, 0, "FAILED")
-        send_telegram_message(f"❌ Trade failed: {str(e)}")
+async def execute_day_trade(current_price, predicted_price, df, balance):
+    if not is_strong_signal(df, current_price, predicted_price):
+        send_telegram_message("⏭️ Skipping - weak signal confirmation")
+        return False
+    volatility_ratio = min(df['atr'].iloc[-1] / df['atr'].mean(), 2.0)
+    stake = round(min(MAX_STAKE_PERCENT * balance * volatility_ratio, MAX_STAKE), 2)
+    contract_type = "CALL" if predicted_price > current_price else "PUT"
+    trade_result = await place_trade(contract_type, stake)
+    if trade_result:
+        send_telegram_message(
+            f"✅ DAY TRADE ENTRY\n"
+            f"Type: {contract_type}\n"
+            f"Current: {round(current_price, 2)}\n"
+            f"Predicted: {round(predicted_price, 2)}\n"
+            f"Stake: ${stake}\n"
+            f"Stop: -{STOP_LOSS_PCT*100}% | Take: +{TAKE_PROFIT_PCT*100}%\n"
+            f"Correlation: DXY={df['corr_dxy'].iloc[-1]:.2f}\n"
+            f"4H RSI: {df['4h_rsi'].iloc[-1]:.1f}"
+        )
+        return True
+    return False
 
 async def main_loop():
-    send_telegram_message("🚀 Gold Trading Bot Started")
+    send_telegram_message("🚀 Advanced Gold Trader Started")
+    model = None
     while True:
         try:
-            if not is_market_open():
-                next_open = "Sunday 6PM EST" if datetime.now(timezone.utc).weekday() >= 5 else "Next trading day"
-                print(f"⏸️ Market closed. Next open: {next_open}")
-                await asyncio.sleep(3600)
+            df = fetch_multi_timeframe_data()
+            if df is None:
+                await asyncio.sleep(600)
                 continue
-            df = with_retry_sync(fetch_hourly_gold_data, "data fetch")
-            if df is not None:
-                current_price = df['price'].iloc[-1]
-                predicted_price = predict_price(df)
-                print(f"📊 Current: {current_price:.2f} | Predicted: {predicted_price:.2f}")
-                await trade_on_signal(current_price, predicted_price)
-            await asyncio.sleep(7200)  # Wait 2 hours between cycles
+            X, y, scaler = prepare_enhanced_data(df)
+            if model is None:
+                try:
+                    model = load_model(MODEL_PATH)
+                except:
+                    model = build_advanced_model((X.shape[1], X.shape[2]))
+                    model.fit(X, y, epochs=20, batch_size=16, verbose=0)
+                    model.save(MODEL_PATH)
+            else:
+                model.fit(X, y, epochs=1, batch_size=8, verbose=0)
+                model.save(MODEL_PATH)
+            current_price = df['price'].iloc[-1]
+            predicted_price = scaler.inverse_transform(
+                model.predict(X[-1].reshape(1, X.shape[1], X.shape[2]))
+            )[0][0]
+            balance = await get_balance()
+            if balance >= MIN_BALANCE:
+                await execute_day_trade(current_price, predicted_price, df, balance)
+            await asyncio.sleep(7200)
         except Exception as e:
-            send_telegram_message(f"🚨 Critical error in main loop: {str(e)}")
-            await asyncio.sleep(300)
+            send_telegram_message(f"🚨 Critical error: {str(e)}")
+            await asyncio.sleep(600)
 
 if __name__ == '__main__':
-    print("🚀 Starting Gold Trading Bot")
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        send_telegram_message("🛑 Bot manually stopped")
-    except Exception as e:
-        send_telegram_message(f"💥 Bot crashed: {str(e)}")
-        raise
+    asyncio.run(main_loop())
