@@ -3,3 +3,4 @@ pandas
 requests
 websockets
 scikit-learn
+pandas-ta
