@@ -15,7 +15,7 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from scipy.stats import pearsonr
 
-# Configurations
+# Configuration
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
@@ -35,11 +35,33 @@ MAX_STAKE = 10000
 VOLATILITY_THRESHOLD = 1.5
 CORRELATION_THRESHOLD = 0.7
 
-# DEBUG MODE FLAG:
 DEBUG_FORCE_TRADE = True
 
+# DNS Resilience
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
+# Multi-endpoint Deriv websocket failover:
+async def safe_deriv_ws_connect():
+    endpoints = [
+        "wss://ws.deriv.com/websockets/v3?app_id=1089",
+        "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+        "wss://ws.deriv.be/websockets/v3?app_id=1089"
+    ]
+
+    for url in endpoints:
+        try:
+            family = socket.AF_INET
+            host = url.split("/")[2].split(":")[0]
+            socket.getaddrinfo(host, None, family)
+            conn = await websockets.connect(url)
+            return conn
+        except Exception as e:
+            print(f"⚠️ Failed to connect to {url}: {str(e)}")
+            continue
+
+    raise ConnectionError("❌ All websocket endpoints failed DNS resolution")
+
+# Telegram helper
 def send_telegram_message(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -47,6 +69,7 @@ def send_telegram_message(msg):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
+# Data fetching & feature engineering
 def fetch_data():
     url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=200&apikey={TWELVE_API_KEY}"
     resp = requests.get(url, timeout=10)
@@ -94,8 +117,9 @@ def prepare_data(df):
         y.append(scaled[i, 0])
     return np.array(X), np.array(y), scaler, df
 
+# Websocket trading
 async def get_balance():
-    async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+    async with await safe_deriv_ws_connect() as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({"balance": 1}))
@@ -103,7 +127,7 @@ async def get_balance():
         return float(json.loads(response)['balance']['balance'])
 
 async def place_trade(contract_type, amount):
-    async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+    async with await safe_deriv_ws_connect() as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({
@@ -155,14 +179,14 @@ async def main_loop():
             current_price = df['price'].iloc[-1]
             prediction_scaled = model.predict(X[-1].reshape(1, X.shape[1], X.shape[2]))
             predicted_price = scaler.inverse_transform(
-                np.concatenate([prediction_scaled, np.zeros((1, X.shape[2]-1))], axis=1)
+                np.concatenate([prediction_scaled, np.zeros((1, X.shape[1]-1))], axis=1)
             )[0][0]
 
             balance = await get_balance()
             if balance >= MIN_BALANCE:
                 await execute_trade(current_price, predicted_price, df, balance, force=DEBUG_FORCE_TRADE)
 
-            await asyncio.sleep(7200)  # 2 hours
+            await asyncio.sleep(7200)
         except Exception as e:
             send_telegram_message(f"❌ Loop error: {str(e)}")
             await asyncio.sleep(600)
