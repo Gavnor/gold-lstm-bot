@@ -6,7 +6,8 @@ import asyncio
 import websockets
 import json
 from datetime import datetime, timedelta, timezone
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 
@@ -22,13 +23,13 @@ LOG_FILE = "data/trade_log.csv"
 
 # CONFIG
 WINDOW_SIZE = 24
-MIN_GAP = 10  # minimum gap between prediction and price to enter trade
+MIN_GAP = 10
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 1.5
 MAX_DAILY_TRADES = 5
 DAILY_COUNTER_FILE = "data/daily_counter.txt"
 
-# Initialize tensorflow thread-safe mode
+# Tensorflow threading (for Railway)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
 
@@ -52,6 +53,7 @@ def load_daily_counter():
         return json.loads(data)
 
 def save_daily_counter(counter):
+    os.makedirs(os.path.dirname(DAILY_COUNTER_FILE), exist_ok=True)
     with open(DAILY_COUNTER_FILE, "w") as f:
         f.write(json.dumps(counter))
 
@@ -103,9 +105,24 @@ def prepare_data(df):
         y.append(scaled[i])
     return np.array(X), np.array(y), scaler
 
-def predict(df):
+def get_or_train_model(df):
     X, y, scaler = prepare_data(df)
-    model = load_model(MODEL_PATH)
+    try:
+        model = load_model(MODEL_PATH)
+    except:
+        send_telegram("⚠ No model found, retraining now...")
+        model = Sequential([
+            LSTM(50, input_shape=(X.shape[1], 1)),
+            Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        model.fit(X, y, epochs=10, batch_size=8, verbose=0)
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        model.save(MODEL_PATH)
+        send_telegram("✅ Model retrained and saved successfully.")
+    return model, scaler, X
+
+def predict(model, scaler, X):
     pred_scaled = model.predict(X[-1].reshape(1, X.shape[1], 1))[0][0]
     pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
     return pred_price
@@ -154,13 +171,14 @@ async def execute_trade(current_price, predicted_price, atr_value):
     await place_trade(contract_type, stake)
     increment_trade_count()
 
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, "a") as f:
         f.write(f"{datetime.utcnow()},{current_price},{predicted_price},{stake},{contract_type}\n")
 
     send_telegram(f"✅ Trade executed: {'BUY' if contract_type == 'CALL' else 'SELL'} | Current: {current_price} | Predicted: {predicted_price} | Stake: {stake}")
 
 async def main_loop():
-    send_telegram("🚀 Bot Started")
+    send_telegram("🚀 Bot Started with Stage 2 upgrades")
     while True:
         try:
             df = fetch_data()
@@ -171,11 +189,12 @@ async def main_loop():
             df['ATR'] = compute_atr(df)
             atr_value = df['ATR'].iloc[-1]
 
-            predicted_price = predict(df)
+            model, scaler, X = get_or_train_model(df)
+            predicted_price = predict(model, scaler, X)
             current_price = df['price'].iloc[-1]
 
             await execute_trade(current_price, predicted_price, atr_value)
-            await asyncio.sleep(7200)  # 2 hours between checks
+            await asyncio.sleep(7200)
 
         except Exception as e:
             send_telegram(f"❌ Loop error: {str(e)}")
@@ -183,4 +202,3 @@ async def main_loop():
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
-    
