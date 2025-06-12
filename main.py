@@ -10,6 +10,7 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
+import random
 
 # ENV VARIABLES
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -25,23 +26,33 @@ LOG_FILE = "data/trade_log.csv"
 WINDOW_SIZE = 24
 MIN_GAP = 10
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.5
 MAX_DAILY_TRADES = 5
 DAILY_COUNTER_FILE = "data/daily_counter.txt"
+MAX_RETRIES = 5
+RETRY_DELAY = 5
 
-# Tensorflow threading (for Railway)
+# THREADING CONTROL (For Railway)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
 
-# UTILS
+# Deriv WebSocket Endpoints Pool
+DERIV_ENDPOINTS = [
+    "wss://ws.deriv.com/websockets/v3?app_id=1089",
+    "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+    "wss://ws.deriv.be/websockets/v3?app_id=1089"
+]
+
+# ------------- UTILS ---------------
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except:
+        pass
 
 def get_today_key():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return today
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def load_daily_counter():
     if not os.path.exists(DAILY_COUNTER_FILE):
@@ -60,11 +71,8 @@ def save_daily_counter(counter):
 def increment_trade_count():
     counter = load_daily_counter()
     today = get_today_key()
-    if today not in counter:
-        counter[today] = 0
-    counter[today] += 1
+    counter[today] = counter.get(today, 0) + 1
     save_daily_counter(counter)
-    return counter[today]
 
 def get_trade_count_today():
     counter = load_daily_counter()
@@ -119,7 +127,7 @@ def get_or_train_model(df):
         model.fit(X, y, epochs=10, batch_size=8, verbose=0)
         os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
         model.save(MODEL_PATH)
-        send_telegram("✅ Model retrained and saved successfully.")
+        send_telegram("✅ Model retrained and saved.")
     return model, scaler, X
 
 def predict(model, scaler, X):
@@ -127,8 +135,21 @@ def predict(model, scaler, X):
     pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
     return pred_price
 
+# Websocket connection with retry + endpoint fallback
+async def connect_to_deriv():
+    for attempt in range(MAX_RETRIES):
+        for url in random.sample(DERIV_ENDPOINTS, len(DERIV_ENDPOINTS)):
+            try:
+                ws = await websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10, ssl=True)
+                await ws.ping()
+                return ws
+            except Exception as e:
+                print(f"⚠ Failed to connect to {url}: {str(e)}")
+                await asyncio.sleep(RETRY_DELAY)
+    raise ConnectionError("❌ All WebSocket endpoints failed after retries.")
+
 async def get_balance():
-    async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+    async with await connect_to_deriv() as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
@@ -137,7 +158,7 @@ async def get_balance():
         return balance
 
 async def place_trade(contract_type, amount):
-    async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+    async with await connect_to_deriv() as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({
@@ -159,8 +180,7 @@ async def execute_trade(current_price, predicted_price, atr_value):
         print("Gap too small, no trade.")
         return
 
-    count_today = get_trade_count_today()
-    if count_today >= MAX_DAILY_TRADES:
+    if get_trade_count_today() >= MAX_DAILY_TRADES:
         print("Max daily trades reached.")
         return
 
@@ -175,10 +195,11 @@ async def execute_trade(current_price, predicted_price, atr_value):
     with open(LOG_FILE, "a") as f:
         f.write(f"{datetime.utcnow()},{current_price},{predicted_price},{stake},{contract_type}\n")
 
-    send_telegram(f"✅ Trade executed: {'BUY' if contract_type == 'CALL' else 'SELL'} | Current: {current_price} | Predicted: {predicted_price} | Stake: {stake}")
+    direction = "BUY" if contract_type == "CALL" else "SELL"
+    send_telegram(f"✅ Trade executed: {direction} | Current: {current_price} | Predicted: {predicted_price} | Stake: {stake}")
 
 async def main_loop():
-    send_telegram("🚀 Bot Started with Stage 2 upgrades")
+    send_telegram("🚀 Fully Resilient Gold Predictor Running")
     while True:
         try:
             df = fetch_data()
