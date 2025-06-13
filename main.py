@@ -26,8 +26,15 @@ RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
-# Networking fix for Railway containers
+# IPv4 DNS forcing
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
+
+# Multiple endpoints for redundancy
+DERIV_ENDPOINTS = [
+    "wss://ws.deriv.com/websockets/v3?app_id=1089",
+    "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+    "wss://ws.deriv.be/websockets/v3?app_id=1089"
+]
 
 # === Utilities ===
 
@@ -85,20 +92,34 @@ def count_today_trades():
     df[0] = pd.to_datetime(df[0])
     return df[df[0].dt.date == today].shape[0]
 
+async def websocket_connect():
+    for endpoint in DERIV_ENDPOINTS:
+        try:
+            ws = await websockets.connect(endpoint, ping_interval=20, ping_timeout=10)
+            return ws
+        except Exception as e:
+            print(f"Failed connection to {endpoint}: {e}")
+    raise ConnectionError("All Deriv WebSocket connections failed.")
+
 async def get_balance():
-    uri = "wss://ws.deriv.com/websockets/v3?app_id=1089"
-    async with websockets.connect(uri) as ws:
+    ws = await websocket_connect()
+    try:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
         await ws.send(json.dumps({"balance": 1}))
         response = await ws.recv()
+        await ws.close()
         return float(json.loads(response)['balance']['balance'])
+    except Exception as e:
+        await ws.close()
+        raise e
 
 async def place_trade(contract_type, stake):
-    uri = "wss://ws.deriv.com/websockets/v3?app_id=1089"
-    async with websockets.connect(uri) as ws:
+    ws = await websocket_connect()
+    try:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
+
         trade = {
             "buy": 1,
             "price": stake,
@@ -114,7 +135,11 @@ async def place_trade(contract_type, stake):
         }
         await ws.send(json.dumps(trade))
         response = await ws.recv()
+        await ws.close()
         return "error" not in json.loads(response)
+    except Exception as e:
+        await ws.close()
+        raise e
 
 async def trade_cycle():
     try:
@@ -143,7 +168,7 @@ async def trade_cycle():
         send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 RSI Gold Bot Running (Stable Build)")
+    send_telegram("🚀 RSI Gold Bot Running (Connection Hardened)")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
