@@ -6,30 +6,31 @@ import csv
 import asyncio
 import websockets
 import json
-import time
 from datetime import datetime, timedelta
 import socket
-import pandas_ta as ta  # simplified indicators
 
-# ENVIRONMENT VARIABLES
+# === ENVIRONMENT VARIABLES ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
-# CONFIGURATION
+# === CONFIGURATION ===
 LOG_FILE = 'data/trade_log.csv'
 MAX_TRADES_PER_DAY = 5
-TRADE_WINDOW_HOURS = 24
+TRADE_INTERVAL = 3600  # check every hour
 MAX_STAKE_PERCENT = 0.2
-MIN_BALANCE = 10
 MAX_STAKE = 10000
-RETRY_DELAY = 5
+MIN_BALANCE = 10
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
-# Networking fix
+# Networking fix for Railway containers
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
 # === Utilities ===
+
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -47,17 +48,25 @@ def fetch_data():
         df = pd.DataFrame(data['values'])
         df['datetime'] = pd.to_datetime(df['datetime'])
         df['close'] = df['close'].astype(float)
-        return df.sort_values('datetime').reset_index(drop=True)
+        df = df.sort_values('datetime').reset_index(drop=True)
+        return df
     except Exception as e:
         send_telegram(f"Fetch error: {e}")
         return None
 
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def rsi_signal(df):
-    df['rsi'] = ta.rsi(df['close'], length=14)
+    df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
     latest_rsi = df['rsi'].iloc[-1]
-    if latest_rsi < 30:
+    if latest_rsi < RSI_OVERSOLD:
         return "CALL"
-    elif latest_rsi > 70:
+    elif latest_rsi > RSI_OVERBOUGHT:
         return "PUT"
     else:
         return None
@@ -98,7 +107,7 @@ async def place_trade(contract_type, stake):
                 "basis": "stake",
                 "contract_type": contract_type,
                 "currency": "USD",
-                "duration": TRADE_WINDOW_HOURS,
+                "duration": 4,
                 "duration_unit": "h",
                 "symbol": "frxXAUUSD"
             }
@@ -134,11 +143,10 @@ async def trade_cycle():
         send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 RSI Gold Bot Running")
+    send_telegram("🚀 RSI Gold Bot Running (Stable Build)")
     while True:
         await trade_cycle()
-        await asyncio.sleep(3600)  # Run every hour
+        await asyncio.sleep(TRADE_INTERVAL)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
-        
