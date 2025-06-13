@@ -1,6 +1,4 @@
 pandas
 numpy
 websockets
-pandas_ta
 requests
-setuptools
