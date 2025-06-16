@@ -18,7 +18,7 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 # === CONFIGURATION ===
 LOG_FILE = 'data/trade_log.csv'
 MAX_TRADES_PER_DAY = 5
-TRADE_INTERVAL = 3600  # check every hour
+TRADE_INTERVAL = 3600  # every 1 hour
 MAX_STAKE_PERCENT = 0.2
 MAX_STAKE = 10000
 MIN_BALANCE = 10
@@ -26,24 +26,23 @@ RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
-# IPv4 DNS forcing
+# Force IPv4 DNS
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
-# Multiple endpoints for redundancy
 DERIV_ENDPOINTS = [
     "wss://ws.deriv.com/websockets/v3?app_id=1089",
     "wss://ws.binaryws.com/websockets/v3?app_id=1089",
     "wss://ws.deriv.be/websockets/v3?app_id=1089"
 ]
 
-# === Utilities ===
+# === Utility Functions ===
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=10)
     except Exception as e:
-        print("Telegram Error:", e)
+        print("Telegram error:", e)
 
 def fetch_data():
     url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=50&apikey={TWELVE_API_KEY}"
@@ -72,9 +71,9 @@ def rsi_signal(df):
     df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
     latest_rsi = df['rsi'].iloc[-1]
     if latest_rsi < RSI_OVERSOLD:
-        return "BUY"
+        return "CALL"
     elif latest_rsi > RSI_OVERBOUGHT:
-        return "SELL"
+        return "PUT"
     else:
         return None
 
@@ -119,7 +118,6 @@ async def place_trade(contract_type, stake):
     try:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
-
         trade = {
             "buy": 1,
             "price": stake,
@@ -135,13 +133,8 @@ async def place_trade(contract_type, stake):
         }
         await ws.send(json.dumps(trade))
         response = await ws.recv()
-        data = json.loads(response)
-        print("🟢 Deriv Response:", data)
-
-        if 'error' in data:
-            send_telegram(f"❌ Trade error: {data['error']['message']}")
-            return False
-        return True
+        await ws.close()
+        return "error" not in json.loads(response)
     except Exception as e:
         await ws.close()
         raise e
@@ -149,31 +142,39 @@ async def place_trade(contract_type, stake):
 async def trade_cycle():
     try:
         if count_today_trades() >= MAX_TRADES_PER_DAY:
-            print("Reached daily trade limit")
+            print("Daily trade limit reached")
             return
 
         df = fetch_data()
-        if df is None: return
+        if df is None:
+            return
 
         signal = rsi_signal(df)
         if signal is None:
-            print("No trade signal at this time")
+            print("No signal generated")
             return
 
+        # map signal to valid contract_type
+        contract_type = "MULTUP" if signal == "CALL" else "MULTDOWN"
+
         balance = await get_balance()
+        if balance < MIN_BALANCE:
+            send_telegram(f"⚠ Low balance: ${balance}")
+            return
+
         stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
 
-        success = await place_trade(signal, stake)
+        success = await place_trade(contract_type, stake)
         if success:
             log_trade(signal, df['close'].iloc[-1], stake)
-            send_telegram(f"✅ Trade executed: {signal}\nPrice: {df['close'].iloc[-1]}\nStake: ${stake}")
+            send_telegram(f"✅ Trade executed:\nDirection: {'BUY' if signal == 'CALL' else 'SELL'}\nPrice: {df['close'].iloc[-1]}\nStake: ${stake}")
         else:
             send_telegram("❌ Trade failed.")
     except Exception as e:
-        send_telegram(f"Loop error: {e}")
+        send_telegram(f"❌ Trade error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 RSI Gold Bot Running (Fully Hardened with Debugging)")
+    send_telegram("🚀 RSI Gold Bot Started (Hardened Version)")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
