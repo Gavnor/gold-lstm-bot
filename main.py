@@ -6,7 +6,7 @@ import csv
 import asyncio
 import websockets
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import socket
 
 # === ENVIRONMENT VARIABLES ===
@@ -72,9 +72,9 @@ def rsi_signal(df):
     df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
     latest_rsi = df['rsi'].iloc[-1]
     if latest_rsi < RSI_OVERSOLD:
-        return "CALL"
+        return "BUY"
     elif latest_rsi > RSI_OVERBOUGHT:
-        return "PUT"
+        return "SELL"
     else:
         return None
 
@@ -82,12 +82,12 @@ def log_trade(direction, price, stake):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([datetime.utcnow().isoformat(), direction, price, stake])
+        writer.writerow([datetime.now(timezone.utc).isoformat(), direction, price, stake])
 
 def count_today_trades():
     if not os.path.exists(LOG_FILE):
         return 0
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     df = pd.read_csv(LOG_FILE, header=None)
     df[0] = pd.to_datetime(df[0])
     return df[df[0].dt.date == today].shape[0]
@@ -134,17 +134,14 @@ async def place_trade(contract_type, stake):
             }
         }
         await ws.send(json.dumps(trade))
-        
-        while True:
-            response = await ws.recv()
-            resp_data = json.loads(response)
-            if resp_data.get("msg_type") == "buy":
-                await ws.close()
-                return True
-            elif "error" in resp_data:
-                await ws.close()
-                print("❌ Trade error:", resp_data['error'])
-                return False
+        response = await ws.recv()
+        data = json.loads(response)
+        print("🟢 Deriv Response:", data)
+
+        if 'error' in data:
+            send_telegram(f"❌ Trade error: {data['error']['message']}")
+            return False
+        return True
     except Exception as e:
         await ws.close()
         raise e
@@ -164,10 +161,6 @@ async def trade_cycle():
             return
 
         balance = await get_balance()
-        if balance < MIN_BALANCE:
-            send_telegram(f"⚠️ Low balance: ${balance:.2f}")
-            return
-
         stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
 
         success = await place_trade(signal, stake)
@@ -180,11 +173,10 @@ async def trade_cycle():
         send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 Hardened RSI Gold Bot Running")
+    send_telegram("🚀 RSI Gold Bot Running (Fully Hardened with Debugging)")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
-    
