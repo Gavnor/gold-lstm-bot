@@ -1,4 +1,5 @@
-pandas
-numpy
-websockets
-requests
+pandas==2.2.2
+numpy==1.26.4
+websockets==12.0
+requests==2.31.0
+python-dotenv==1.0.1
