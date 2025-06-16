@@ -134,9 +134,17 @@ async def place_trade(contract_type, stake):
             }
         }
         await ws.send(json.dumps(trade))
-        response = await ws.recv()
-        await ws.close()
-        return "error" not in json.loads(response)
+        
+        while True:
+            response = await ws.recv()
+            resp_data = json.loads(response)
+            if resp_data.get("msg_type") == "buy":
+                await ws.close()
+                return True
+            elif "error" in resp_data:
+                await ws.close()
+                print("❌ Trade error:", resp_data['error'])
+                return False
     except Exception as e:
         await ws.close()
         raise e
@@ -156,6 +164,10 @@ async def trade_cycle():
             return
 
         balance = await get_balance()
+        if balance < MIN_BALANCE:
+            send_telegram(f"⚠️ Low balance: ${balance:.2f}")
+            return
+
         stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
 
         success = await place_trade(signal, stake)
@@ -168,10 +180,11 @@ async def trade_cycle():
         send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 RSI Gold Bot Running (Connection Hardened)")
+    send_telegram("🚀 Hardened RSI Gold Bot Running")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
+    
