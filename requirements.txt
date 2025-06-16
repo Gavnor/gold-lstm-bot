@@ -1,8 +1,5 @@
-aiohttp==3.9.3
-asyncio
-pandas==2.2.2
-numpy==1.26.4
-websockets==12.0
-requests==2.31.0
-python-dateutil==2.9.0.post0
-certifi
+pandas
+numpy
+websockets
+requests
+python-dotenv
