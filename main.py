@@ -6,7 +6,7 @@ import csv
 import asyncio
 import websockets
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import socket
 
 # === ENVIRONMENT VARIABLES ===
@@ -18,25 +18,23 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 # === CONFIGURATION ===
 LOG_FILE = 'data/trade_log.csv'
 MAX_TRADES_PER_DAY = 5
-TRADE_INTERVAL = 3600  # 1 hour
+TRADE_INTERVAL = 3600  # check every hour
 MAX_STAKE_PERCENT = 0.2
 MAX_STAKE = 10000
 MIN_BALANCE = 10
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 60  # Looser threshold
+RSI_OVERSOLD = 40    # Looser threshold
+EMA_PERIOD = 20
 
 # IPv4 DNS forcing
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
-# Deriv hardened endpoints
 DERIV_ENDPOINTS = [
     "wss://ws.deriv.com/websockets/v3?app_id=1089",
     "wss://ws.binaryws.com/websockets/v3?app_id=1089",
     "wss://ws.deriv.be/websockets/v3?app_id=1089"
 ]
-
-# === UTILITIES ===
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -68,13 +66,21 @@ def compute_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def compute_ema(series, period=20):
+    return series.ewm(span=period, adjust=False).mean()
+
 def rsi_signal(df):
     df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
+    df['ema'] = compute_ema(df['close'], period=EMA_PERIOD)
     latest_rsi = df['rsi'].iloc[-1]
-    send_telegram(f"🔎 RSI check: {latest_rsi:.2f}")  # Always report RSI
-    if latest_rsi < RSI_OVERSOLD:
+    latest_price = df['close'].iloc[-1]
+    ema = df['ema'].iloc[-1]
+
+    send_telegram(f"🔍 RSI check: {latest_rsi:.2f} | Price: {latest_price:.2f} | EMA20: {ema:.2f}")
+
+    if latest_rsi < RSI_OVERSOLD and latest_price > ema:
         return "CALL"
-    elif latest_rsi > RSI_OVERBOUGHT:
+    elif latest_rsi > RSI_OVERBOUGHT and latest_price < ema:
         return "PUT"
     else:
         return None
@@ -83,12 +89,12 @@ def log_trade(direction, price, stake):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([datetime.now().isoformat(), direction, price, stake])
+        writer.writerow([datetime.now(timezone.utc).isoformat(), direction, price, stake])
 
 def count_today_trades():
     if not os.path.exists(LOG_FILE):
         return 0
-    today = datetime.now().date()
+    today = datetime.now(timezone.utc).date()
     df = pd.read_csv(LOG_FILE, header=None)
     df[0] = pd.to_datetime(df[0])
     return df[df[0].dt.date == today].shape[0]
@@ -115,21 +121,11 @@ async def get_balance():
         await ws.close()
         raise e
 
-async def place_trade(signal, stake):
+async def place_trade(contract_type, stake):
     ws = await websocket_connect()
     try:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
-
-        # 🔑 Map CALL/PUT to Deriv RISE/FALL contracts
-        if signal == "CALL":
-            contract_type = "RISE"
-        elif signal == "PUT":
-            contract_type = "FALL"
-        else:
-            send_telegram("❌ Invalid trade signal.")
-            await ws.close()
-            return False
 
         trade = {
             "buy": 1,
@@ -147,13 +143,7 @@ async def place_trade(signal, stake):
         await ws.send(json.dumps(trade))
         response = await ws.recv()
         await ws.close()
-
-        data = json.loads(response)
-        if "error" in data:
-            send_telegram(f"❌ Trade error: {data['error']['message']}")
-            return False
-        return True
-
+        return "error" not in json.loads(response)
     except Exception as e:
         await ws.close()
         raise e
@@ -161,12 +151,11 @@ async def place_trade(signal, stake):
 async def trade_cycle():
     try:
         if count_today_trades() >= MAX_TRADES_PER_DAY:
-            send_telegram("📛 Daily trade limit reached.")
+            print("Reached daily trade limit")
             return
 
         df = fetch_data()
-        if df is None: 
-            send_telegram("⚠️ Failed to fetch data.")
+        if df is None:
             return
 
         signal = rsi_signal(df)
@@ -182,12 +171,12 @@ async def trade_cycle():
             log_trade(signal, df['close'].iloc[-1], stake)
             send_telegram(f"✅ Trade executed: {signal}\nPrice: {df['close'].iloc[-1]}\nStake: ${stake}")
         else:
-            send_telegram("❌ Trade failed after request.")
+            send_telegram("❌ Trade failed.")
     except Exception as e:
-        send_telegram(f"❌ Loop error: {e}")
+        send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 Hardened RSI Gold Bot Running")
+    send_telegram("🚀 RSI Gold Bot Running (EMA+RSI Logic)")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
