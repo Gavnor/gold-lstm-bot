@@ -36,7 +36,7 @@ DERIV_ENDPOINTS = [
     "wss://ws.deriv.be/websockets/v3?app_id=1089"
 ]
 
-# === UTILITIES ===
+# === Utilities ===
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -68,21 +68,29 @@ def compute_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def rsi_signal(df):
-    df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
-    latest_rsi = df['rsi'].iloc[-1]
-    if latest_rsi < RSI_OVERSOLD:
-        return "CALL"
-    elif latest_rsi > RSI_OVERBOUGHT:
-        return "PUT"
-    else:
-        return None
+def compute_ema(series, period=20):
+    return series.ewm(span=period, adjust=False).mean()
 
-def log_trade(direction, price, stake):
+def rsi_ema_signal(df):
+    df['rsi'] = compute_rsi(df['close'], period=RSI_PERIOD)
+    df['ema20'] = compute_ema(df['close'])
+    rsi = df['rsi'].iloc[-1]
+    price = df['close'].iloc[-1]
+    ema = df['ema20'].iloc[-1]
+
+    send_telegram(f"🔍 RSI: {rsi:.2f} | Price: {price:.2f} | EMA20: {ema:.2f}")
+
+    if rsi < RSI_OVERSOLD and price > ema:
+        return "CALL"
+    elif rsi > RSI_OVERBOUGHT and price < ema:
+        return "PUT"
+    return None
+
+def log_trade(direction, price, stake, status):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([datetime.now(timezone.utc).isoformat(), direction, price, stake])
+        writer.writerow([datetime.now(timezone.utc).isoformat(), direction, price, stake, status])
 
 def count_today_trades():
     if not os.path.exists(LOG_FILE):
@@ -119,7 +127,6 @@ async def place_trade(contract_type, stake):
     try:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
-
         trade = {
             "buy": 1,
             "price": stake,
@@ -133,23 +140,18 @@ async def place_trade(contract_type, stake):
                 "symbol": "frxXAUUSD"
             }
         }
-
         await ws.send(json.dumps(trade))
         response = await ws.recv()
+        result = json.loads(response)
         await ws.close()
-
-        response_data = json.loads(response)
-        print("📦 Trade Request:", json.dumps(trade, indent=2))
-        print("📬 Trade Response:", json.dumps(response_data, indent=2))
-
-        if "error" in response_data:
-            send_telegram(f"❌ Trade error: {response_data['error']['message']}")
+        if "error" not in result:
+            return True
+        else:
+            print("Trade error:", result['error'])
             return False
-
-        return True
     except Exception as e:
         await ws.close()
-        send_telegram(f"❌ Trade exception: {e}")
+        print("Trade execution error:", e)
         return False
 
 async def trade_cycle():
@@ -159,16 +161,12 @@ async def trade_cycle():
             return
 
         df = fetch_data()
-        if df is None: return
+        if df is None:
+            return
 
-        signal = rsi_signal(df)
-        rsi_val = round(df['rsi'].iloc[-1], 2)
-        price = df['close'].iloc[-1]
-
-        print(f"🔍 RSI: {rsi_val} | Price: {price}")
-
+        signal = rsi_ema_signal(df)
         if signal is None:
-            send_telegram(f"🔍 RSI: {rsi_val} | Price: {price}\nNo trade signal detected.")
+            send_telegram("📉 No valid trade signal this round.")
             return
 
         balance = await get_balance()
@@ -176,15 +174,17 @@ async def trade_cycle():
 
         success = await place_trade(signal, stake)
         if success:
-            log_trade(signal, price, stake)
-            send_telegram(f"✅ Trade executed: {signal}\nPrice: {price}\nStake: ${stake}")
+            log_trade(signal, df['close'].iloc[-1], stake, "SUCCESS")
+            send_telegram(f"✅ Trade executed: {signal}\nPrice: {df['close'].iloc[-1]}\nStake: ${stake}")
         else:
+            log_trade(signal, df['close'].iloc[-1], stake, "FAILED")
             send_telegram(f"❌ Trade failed. Signal: {signal} | Stake: ${stake}")
+
     except Exception as e:
         send_telegram(f"Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 Gold RSI Bot (Debug Mode) Running")
+    send_telegram("🚀 Gold RSI+EMA Bot Running")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
