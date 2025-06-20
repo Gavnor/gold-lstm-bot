@@ -1,7 +1,8 @@
 pandas
 numpy
 requests
-websockets
 scikit-learn
-python-telegram-bot==13.15
-tensorflow==2.15.0
+websockets
+python-telegram-bot
+asyncio
+joblib
