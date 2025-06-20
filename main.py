@@ -6,7 +6,7 @@ import csv
 import asyncio
 import websockets
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import socket
 
 # === ENVIRONMENT VARIABLES ===
@@ -18,25 +18,26 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 # === CONFIGURATION ===
 LOG_FILE = 'data/trade_log.csv'
 MAX_TRADES_PER_DAY = 5
-TRADE_INTERVAL = 3600  # Every hour
+TRADE_INTERVAL = 3600  # 1 hour
 MAX_STAKE_PERCENT = 0.2
 MAX_STAKE = 10000
 MIN_BALANCE = 10
+EMA_PERIOD = 20
 RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
+RSI_OVERBOUGHT = 60
+RSI_OVERSOLD = 40
 
-# DNS workaround
+# Harden DNS resolution to IPv4
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
+# === Deriv WebSocket Endpoints ===
 DERIV_ENDPOINTS = [
     "wss://ws.deriv.com/websockets/v3?app_id=1089",
     "wss://ws.binaryws.com/websockets/v3?app_id=1089",
     "wss://ws.deriv.be/websockets/v3?app_id=1089"
 ]
 
-# === UTILITIES ===
-
+# === Utilities ===
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -45,11 +46,11 @@ def send_telegram(msg):
         print("Telegram Error:", e)
 
 def fetch_data():
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=50&apikey={TWELVE_API_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=100&apikey={TWELVE_API_KEY}"
     try:
         data = requests.get(url, timeout=10).json()
         if 'values' not in data:
-            send_telegram(f"⚠️ Data error: {data}")
+            send_telegram(f"⚠ Data error: {data}")
             return None
         df = pd.DataFrame(data['values'])
         df['datetime'] = pd.to_datetime(df['datetime'])
@@ -60,33 +61,31 @@ def fetch_data():
         send_telegram(f"❌ Fetch error: {e}")
         return None
 
-def compute_rsi(series, period=RSI_PERIOD):
+def compute_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 def compute_ema(series, period=20):
     return series.ewm(span=period, adjust=False).mean()
 
-def strategy_rsi_ema(df):
-    df['rsi'] = compute_rsi(df['close'])
-    df['ema20'] = compute_ema(df['close'])
-    latest = df.iloc[-1]
+def rsi_ema_signal(df):
+    df['rsi'] = compute_rsi(df['close'], RSI_PERIOD)
+    df['ema'] = compute_ema(df['close'], EMA_PERIOD)
+    rsi = df['rsi'].iloc[-1]
+    price = df['close'].iloc[-1]
+    ema = df['ema'].iloc[-1]
 
-    rsi = latest['rsi']
-    price = latest['close']
-    ema20 = latest['ema20']
+    msg = f"🔍 RSI check: {rsi:.2f} | Price: {price:.2f}\nEMA20: {ema:.2f}"
+    send_telegram(msg)
 
-    send_telegram(f"🔍 RSI: {rsi:.2f} | Price: {price:.2f} | EMA20: {ema20:.2f}")
-
-    if rsi < RSI_OVERSOLD and price < ema20:
+    if rsi < RSI_OVERSOLD and price < ema:
         return "CALL"
-    elif rsi > RSI_OVERBOUGHT and price > ema20:
+    elif rsi > RSI_OVERBOUGHT and price > ema:
         return "PUT"
-    else:
-        return None
+    return None
 
 def log_trade(direction, price, stake):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -97,10 +96,9 @@ def log_trade(direction, price, stake):
 def count_today_trades():
     if not os.path.exists(LOG_FILE):
         return 0
-    today = datetime.now(timezone.utc).date()
     df = pd.read_csv(LOG_FILE, header=None)
     df[0] = pd.to_datetime(df[0])
-    return df[df[0].dt.date == today].shape[0]
+    return df[df[0].dt.date == datetime.now(timezone.utc).date()].shape[0]
 
 async def websocket_connect():
     for endpoint in DERIV_ENDPOINTS:
@@ -108,7 +106,7 @@ async def websocket_connect():
             ws = await websockets.connect(endpoint, ping_interval=20, ping_timeout=10)
             return ws
         except Exception as e:
-            print(f"❌ Failed connection to {endpoint}: {e}")
+            print(f"Failed connection to {endpoint}: {e}")
     raise ConnectionError("All Deriv WebSocket connections failed.")
 
 async def get_balance():
@@ -146,9 +144,7 @@ async def place_trade(contract_type, stake):
         await ws.send(json.dumps(trade))
         response = await ws.recv()
         await ws.close()
-
-        result = json.loads(response)
-        return "error" not in result
+        return "error" not in json.loads(response)
     except Exception as e:
         await ws.close()
         raise e
@@ -156,34 +152,41 @@ async def place_trade(contract_type, stake):
 async def trade_cycle():
     try:
         if count_today_trades() >= MAX_TRADES_PER_DAY:
-            print("🔁 Daily trade limit reached")
+            print("⛔ Reached daily trade limit")
             return
 
         df = fetch_data()
-        if df is None: return
+        if df is None:
+            return
 
-        signal = strategy_rsi_ema(df)
+        signal = rsi_ema_signal(df)
         if signal is None:
-            print("📉 No valid signal")
+            send_telegram("📉 No signal detected this round.")
             return
 
         balance = await get_balance()
-        stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
+        if balance < MIN_BALANCE:
+            send_telegram(f"⚠ Low balance: ${balance:.2f}")
+            return
 
+        stake = round(min(MAX_STAKE_PERCENT * balance, MAX_STAKE), 2)
         success = await place_trade(signal, stake)
+
         if success:
             log_trade(signal, df['close'].iloc[-1], stake)
-            send_telegram(f"✅ Trade executed: {signal}\nPrice: {df['close'].iloc[-1]:.2f}\nStake: ${stake}")
+            send_telegram(f"\n🚀 Trade executed: {signal}\nPrice: {df['close'].iloc[-1]}\nStake: ${stake}")
         else:
-            send_telegram(f"❌ Trade failed. Signal: {signal} | Stake: ${stake}")
+            send_telegram("❌ Trade failed.")
+
     except Exception as e:
         send_telegram(f"❌ Loop error: {e}")
 
 async def main_loop():
-    send_telegram("🚀 Gold Predictor RSI + EMA20 Bot Running")
+    send_telegram("🚀 RSI+EMA Gold Bot Running")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
 
 if __name__ == '__main__':
     asyncio.run(main_loop())
+        
