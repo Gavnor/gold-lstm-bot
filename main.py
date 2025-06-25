@@ -1,3 +1,5 @@
+# enhanced_gold_bot/main.py
+
 import os
 import requests
 import pandas as pd
@@ -20,15 +22,15 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # === CONFIG ===
 MAX_TRADES_PER_DAY = 5
-TRADE_INTERVAL = 3600  # seconds
+TRADE_INTERVAL = 3600
 LOG_FILE = 'data/trade_log.csv'
 MAX_STAKE_PERCENT = 0.2
 MAX_STAKE = 1000
+STAKE_CAP = 4999
 MIN_BALANCE = 10
-STAKE_CAP = 5000
 CONF_THRESHOLD = 0.6
+ADX_PERIOD = 14
 
-# Force IPv4 DNS
 socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 DERIV_ENDPOINTS = [
     "wss://ws.deriv.com/websockets/v3?app_id=1089",
@@ -39,8 +41,7 @@ DERIV_ENDPOINTS = [
 # === UTILS ===
 def send_telegram(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
     except Exception as e:
         print("Telegram error:", e)
 
@@ -68,12 +69,23 @@ def compute_rsi(series, period=14):
 def compute_ema(series, period=20):
     return series.ewm(span=period).mean()
 
+def compute_adx(prices, period=14):
+    high = prices * 1.002
+    low = prices * 0.998
+    close = prices
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    tr = (high.combine(low, max) - low.combine(close.shift(), min)).rolling(period).mean()
+    adx = (abs(plus_dm - minus_dm) / tr).rolling(period).mean()
+    return adx
+
 def prepare_features(df):
     df['return'] = df['price'].pct_change()
     df['rsi'] = compute_rsi(df['price'])
     df['ema20'] = compute_ema(df['price'])
     df['delta'] = df['price'] - df['ema20']
     df['volatility'] = df['return'].rolling(10).std()
+    df['adx'] = compute_adx(df['price'])
     df = df.dropna().copy()
     df['target'] = (df['price'].shift(-1) > df['price']).astype(int)
     return df
@@ -94,6 +106,15 @@ def count_today_trades():
     df = pd.read_csv(LOG_FILE, header=None)
     df[0] = pd.to_datetime(df[0])
     return df[df[0].dt.date == datetime.now(timezone.utc).date()].shape[0]
+
+def recent_losses_and_direction():
+    if not os.path.exists(LOG_FILE): return 0, []
+    df = pd.read_csv(LOG_FILE, header=None)
+    df.columns = ['time', 'direction', 'price', 'stake', 'pnl'] if df.shape[1] == 5 else ['time', 'direction', 'price', 'stake']
+    df = df.tail(5)
+    loss_streak = (df['pnl'] < 0).sum() if 'pnl' in df.columns else 0
+    directions = df['direction'].tolist()
+    return loss_streak, directions
 
 def log_trade(direction, price, stake):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -142,8 +163,10 @@ async def place_trade(direction, stake):
 async def trade_cycle():
     if count_today_trades() >= MAX_TRADES_PER_DAY:
         return
+
     df = fetch_data()
     if df is None: return
+
     df = prepare_features(df)
     model, scaler = train_model(df)
     X_latest = scaler.transform([df[['rsi', 'delta', 'volatility']].iloc[-1]])
@@ -153,22 +176,36 @@ async def trade_cycle():
     current_price = df['price'].iloc[-1]
     ema = df['ema20'].iloc[-1]
     rsi = df['rsi'].iloc[-1]
-    
+    adx = df['adx'].iloc[-1]
     direction = "buy" if pred_class == 1 else "sell"
+
     if confidence < CONF_THRESHOLD:
-        print(f"Low confidence: {confidence:.2f}")
+        send_telegram(f"⚠ Low confidence: {confidence:.2f}, skipping trade")
+        return
+
+    if adx < 20:
+        send_telegram(f"📉 ADX too low ({adx:.2f}), market likely range-bound. Skipping.")
+        return
+
+    losses, directions = recent_losses_and_direction()
+    if directions[-2:] == [direction, direction]:
+        send_telegram(f"🚫 Avoiding 3rd {direction} in a row. Skipping.")
         return
 
     if direction == "buy" and not (rsi < 50 and current_price < ema):
-        print("Buy rejected due to logic filter")
         return
     if direction == "sell" and not (rsi > 50 and current_price > ema):
-        print("Sell rejected due to logic filter")
         return
 
     try:
         balance = await get_balance()
-        stake = round(min(balance * MAX_STAKE_PERCENT, MAX_STAKE, 4999), 2)
+        stake = round(min(balance * MAX_STAKE_PERCENT, MAX_STAKE), 2)
+        if losses >= 2:
+            stake = round(stake * 0.5, 2)
+
+        if stake > STAKE_CAP:
+            stake = STAKE_CAP
+
         success = await place_trade(direction, stake)
         if success:
             log_trade(direction, current_price, stake)
@@ -179,7 +216,7 @@ async def trade_cycle():
         send_telegram(f"❌ Trade error: {str(e)}")
 
 async def main_loop():
-    send_telegram("🚀 ML-Enhanced Gold Bot Started")
+    send_telegram("🚀 ML Gold Bot with Filters Running")
     while True:
         await trade_cycle()
         await asyncio.sleep(TRADE_INTERVAL)
